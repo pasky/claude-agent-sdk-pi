@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir, homedir } from "node:os";
+import { basename, join } from "node:path";
 import type { Context } from "@mariozechner/pi-ai";
 import { __test } from "../index.ts";
 
@@ -157,6 +160,68 @@ test("resume tail dedupes repeated tool_result ids across separated segments", a
 	assert.deepEqual(seenToolResultIds, ["toolu_dup"]);
 });
 
+test("pending replay anchor filtering keeps only tool_result ids present in resume anchor", async () => {
+	const unique = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+	const fakeCwd = join(tmpdir(), `casdk-anchor-${unique}`);
+	const projectDir = `-${fakeCwd.replace(/[^a-zA-Z0-9]/g, "-")}`;
+	const projectPath = join(homedir(), ".claude", "projects", projectDir);
+	const sessionId = `sdk-anchor-${unique}`;
+	const sessionFile = join(projectPath, `${sessionId}.jsonl`);
+	mkdirSync(projectPath, { recursive: true });
+	writeFileSync(
+		sessionFile,
+		[
+			JSON.stringify({
+				type: "assistant",
+				uuid: "anchor-uuid",
+				message: {
+					content: [
+						{ type: "tool_use", id: "toolu_keep", name: "Read", input: {} },
+					],
+				},
+			}),
+			JSON.stringify({
+				type: "assistant",
+				uuid: "other-uuid",
+				message: {
+					content: [{ type: "tool_use", id: "toolu_other", name: "Bash", input: {} }],
+				},
+			}),
+		].join("\n") + "\n",
+		"utf-8",
+	);
+
+	try {
+		const filteredIds = __test.filterReplayToolUseIdsForResumeAnchor(
+			new Set(["toolu_keep", "toolu_drop"]),
+			sessionId,
+			fakeCwd,
+			"anchor-uuid",
+		);
+		assert.deepEqual([...filteredIds], ["toolu_keep"]);
+
+		const tail: Context["messages"] = [
+			toolResult("toolu_keep", "ok"),
+			toolResult("toolu_drop", "should be skipped"),
+		];
+		const prompt = __test.buildResumePromptFromTail(tail, true, filteredIds);
+		const messages = await collectPromptMessages(prompt);
+		const replayedIds: string[] = [];
+		for (const message of messages) {
+			const content = (message.message as { content?: unknown } | undefined)?.content;
+			if (!Array.isArray(content)) continue;
+			for (const block of content as Array<{ type?: string; tool_use_id?: string }>) {
+				if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
+					replayedIds.push(block.tool_use_id);
+				}
+			}
+		}
+		assert.deepEqual(replayedIds, ["toolu_keep"]);
+	} finally {
+		rmSync(projectPath, { recursive: true, force: true });
+	}
+});
+
 test("pending tool-use continuation -> replay tool results, do not summarize", () => {
 	const tail: Context["messages"] = [toolResult("toolu_123", "ok"), user("continue")];
 	const plan = __test.analyzeResumeTailMessages(tail, 123456);
@@ -179,14 +244,14 @@ test("compaction-like assistant text is preserved in historical summary", () => 
 test("tree/fork-style divergence (branch behind all) triggers Claude fork anchor", () => {
 	const branch = {
 		sdkSessionId: "sdk-1",
-		uuidByAssistantTimestamp: new Map<number, string>([[100, "uuid-100"]]),
+		uuidByAssistantTimestamp: new Map<number, string[]>([[100, ["uuid-100"]]]),
 		maxTimestamp: 100,
 	};
 	const all = {
 		sdkSessionId: "sdk-1",
-		uuidByAssistantTimestamp: new Map<number, string>([
-			[100, "uuid-100"],
-			[200, "uuid-200"],
+		uuidByAssistantTimestamp: new Map<number, string[]>([
+			[100, ["uuid-100"]],
+			[200, ["uuid-200"]],
 		]),
 		maxTimestamp: 200,
 	};
@@ -199,24 +264,42 @@ test("tree/fork-style divergence (branch behind all) triggers Claude fork anchor
 test("pending tool-use timestamp forces fork from pending assistant uuid", () => {
 	const branch = {
 		sdkSessionId: "sdk-1",
-		uuidByAssistantTimestamp: new Map<number, string>([
-			[100, "uuid-100"],
-			[200, "uuid-200"],
+		uuidByAssistantTimestamp: new Map<number, string[]>([
+			[100, ["uuid-100"]],
+			[200, ["uuid-200"]],
 		]),
 		maxTimestamp: 100,
 		pendingToolUseTimestamp: 200,
 	};
 	const all = {
 		sdkSessionId: "sdk-1",
-		uuidByAssistantTimestamp: new Map<number, string>([
-			[100, "uuid-100"],
-			[200, "uuid-200"],
+		uuidByAssistantTimestamp: new Map<number, string[]>([
+			[100, ["uuid-100"]],
+			[200, ["uuid-200"]],
 		]),
 		maxTimestamp: 200,
 	};
 
 	const plan = __test.computeResumeForkPlan(branch, all);
 	assert.equal(plan.resumeSessionAt, "uuid-200");
+	assert.equal(plan.forkSession, true);
+});
+
+test("pending tool-use timestamp picks latest uuid when multiple assistants share timestamp", () => {
+	const branch = {
+		sdkSessionId: "sdk-1",
+		uuidByAssistantTimestamp: new Map<number, string[]>([[200, ["uuid-older", "uuid-latest"]]]),
+		maxTimestamp: 200,
+		pendingToolUseTimestamp: 200,
+	};
+	const all = {
+		sdkSessionId: "sdk-1",
+		uuidByAssistantTimestamp: new Map<number, string[]>([[200, ["uuid-older", "uuid-latest"]]]),
+		maxTimestamp: 200,
+	};
+
+	const plan = __test.computeResumeForkPlan(branch, all);
+	assert.equal(plan.resumeSessionAt, "uuid-latest");
 	assert.equal(plan.forkSession, true);
 });
 
@@ -244,8 +327,28 @@ test("buildSdkStateFromEntries ignores non-provider entries and tracks latest sd
 	const state = __test.buildSdkStateFromEntries(entries);
 	assert.equal(state.sdkSessionId, "sdk-abc");
 	assert.equal(state.maxTimestamp, 222);
-	assert.equal(state.uuidByAssistantTimestamp.get(111), "uuid-111");
-	assert.equal(state.uuidByAssistantTimestamp.get(222), "uuid-222");
+	assert.deepEqual(state.uuidByAssistantTimestamp.get(111), ["uuid-111"]);
+	assert.deepEqual(state.uuidByAssistantTimestamp.get(222), ["uuid-222"]);
+});
+
+
+
+test("buildSdkStateFromEntries preserves multiple assistant uuids at same timestamp", () => {
+	const entries: Array<Record<string, any>> = [
+		{
+			type: "custom",
+			customType: "claude-agent-sdk",
+			data: { assistantTimestamp: 111, sdkAssistantUuid: "uuid-a" },
+		},
+		{
+			type: "custom",
+			customType: "claude-agent-sdk",
+			data: { assistantTimestamp: 111, sdkAssistantUuid: "uuid-b" },
+		},
+	];
+
+	const state = __test.buildSdkStateFromEntries(entries);
+	assert.deepEqual(state.uuidByAssistantTimestamp.get(111), ["uuid-a", "uuid-b"]);
 });
 
 test("sanitizeAssistantContentForEmit drops incomplete tool calls", () => {
@@ -300,9 +403,9 @@ test("findLastSdkAssistantInfo skips errored assistant anchors", () => {
 	const messages: Context["messages"] = [user("u1"), okAssistant, user("u2"), badAssistant];
 	const state = {
 		sdkSessionId: "sdk-1",
-		uuidByAssistantTimestamp: new Map<number, string>([
-			[okAssistant.timestamp, "uuid-ok"],
-			[badAssistant.timestamp, "uuid-bad"],
+		uuidByAssistantTimestamp: new Map<number, string[]>([
+			[okAssistant.timestamp, ["uuid-ok"]],
+			[badAssistant.timestamp, ["uuid-bad"]],
 		]),
 		maxTimestamp: badAssistant.timestamp,
 		pendingToolUseTimestamp: undefined,

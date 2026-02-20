@@ -56,7 +56,7 @@ type SdkSessionEntryData = {
 
 type SdkSessionState = {
 	sdkSessionId?: string;
-	uuidByAssistantTimestamp: Map<number, string>;
+	uuidByAssistantTimestamp: Map<number, string[]>;
 	maxTimestamp?: number;
 	pendingToolUseTimestamp?: number;
 	pendingToolUseIds?: string[];
@@ -506,6 +506,13 @@ type ResumeForkPlan = {
 	forkSession?: boolean;
 };
 
+function getLatestAssistantUuidAtTimestamp(state: SdkSessionState | undefined, timestamp: number | undefined): string | undefined {
+	if (!state || timestamp == null) return undefined;
+	const uuids = state.uuidByAssistantTimestamp.get(timestamp);
+	if (!uuids || uuids.length === 0) return undefined;
+	return uuids[uuids.length - 1];
+}
+
 function computeResumeForkPlan(
 	branchState: SdkSessionState | undefined,
 	allState: SdkSessionState | undefined,
@@ -518,12 +525,12 @@ function computeResumeForkPlan(
 		allState?.maxTimestamp != null &&
 		branchState.maxTimestamp < allState.maxTimestamp
 	) {
-		resumeSessionAt = branchState.uuidByAssistantTimestamp.get(branchState.maxTimestamp);
+		resumeSessionAt = getLatestAssistantUuidAtTimestamp(branchState, branchState.maxTimestamp);
 		forkSession = Boolean(resumeSessionAt);
 	}
 
 	if (branchState?.pendingToolUseTimestamp != null) {
-		const pendingUuid = branchState.uuidByAssistantTimestamp.get(branchState.pendingToolUseTimestamp);
+		const pendingUuid = getLatestAssistantUuidAtTimestamp(branchState, branchState.pendingToolUseTimestamp);
 		if (pendingUuid) {
 			resumeSessionAt = pendingUuid;
 			forkSession = true;
@@ -663,7 +670,7 @@ function findLastSdkAssistantInfo(
 		if (message?.role !== "assistant") continue;
 		if (isErroredAssistantMessage(message)) continue;
 		const timestamp = message.timestamp;
-		const uuid = state.uuidByAssistantTimestamp.get(timestamp);
+		const uuid = getLatestAssistantUuidAtTimestamp(state, timestamp);
 		if (uuid) {
 			return { index: i, timestamp, uuid };
 		}
@@ -788,11 +795,20 @@ function createEmptySdkState(): SdkSessionState {
 function cloneSdkState(state: SdkSessionState): SdkSessionState {
 	return {
 		sdkSessionId: state.sdkSessionId,
-		uuidByAssistantTimestamp: new Map(state.uuidByAssistantTimestamp),
+		uuidByAssistantTimestamp: new Map(
+			Array.from(state.uuidByAssistantTimestamp.entries(), ([timestamp, uuids]) => [timestamp, [...uuids]]),
+		),
 		maxTimestamp: state.maxTimestamp,
 		pendingToolUseTimestamp: state.pendingToolUseTimestamp,
 		pendingToolUseIds: state.pendingToolUseIds ? [...state.pendingToolUseIds] : undefined,
 	};
+}
+
+function addAssistantUuidAtTimestamp(state: SdkSessionState, timestamp: number, uuid: string): void {
+	const existing = state.uuidByAssistantTimestamp.get(timestamp) ?? [];
+	if (existing.includes(uuid)) return;
+	existing.push(uuid);
+	state.uuidByAssistantTimestamp.set(timestamp, existing);
 }
 
 function buildSdkStateFromEntries(entries: Array<Record<string, any>>): SdkSessionState {
@@ -810,7 +826,7 @@ function buildSdkStateFromEntries(entries: Array<Record<string, any>>): SdkSessi
 			typeof data.sdkAssistantUuid === "string" &&
 			data.sdkAssistantUuid.trim().length > 0
 		) {
-			state.uuidByAssistantTimestamp.set(data.assistantTimestamp, data.sdkAssistantUuid);
+			addAssistantUuidAtTimestamp(state, data.assistantTimestamp, data.sdkAssistantUuid);
 			if (state.maxTimestamp == null || data.assistantTimestamp > state.maxTimestamp) {
 				state.maxTimestamp = data.assistantTimestamp;
 			}
@@ -859,7 +875,7 @@ function updateSessionState(sessionKey: string, data: SdkSessionEntryData): void
 			typeof data.sdkAssistantUuid === "string" &&
 			data.sdkAssistantUuid.trim().length > 0
 		) {
-			target.uuidByAssistantTimestamp.set(data.assistantTimestamp, data.sdkAssistantUuid);
+			addAssistantUuidAtTimestamp(target, data.assistantTimestamp, data.sdkAssistantUuid);
 			if (target.maxTimestamp == null || data.assistantTimestamp > target.maxTimestamp) {
 				target.maxTimestamp = data.assistantTimestamp;
 			}
@@ -917,17 +933,30 @@ function refreshSessionState(ctx: {
 	}
 }
 
-function getSdkSessionFilePath(sessionId: string, cwd: string): string {
-	let projectDir = cwd.replace(/[\\/]+/g, "-");
-	if (!projectDir.startsWith("-")) projectDir = `-${projectDir}`;
-	return join(homedir(), ".claude", "projects", projectDir, `${sessionId}.jsonl`);
+function getSdkSessionFilePath(sessionId: string, cwd: string): string | undefined {
+	const projectsRoot = join(homedir(), ".claude", "projects");
+	const normalized = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+	const projectDir = normalized.startsWith("-") ? normalized : `-${normalized}`;
+	const directPath = join(projectsRoot, projectDir, `${sessionId}.jsonl`);
+	if (existsSync(directPath)) return directPath;
+
+	try {
+		const suffix = `${sessionId}.jsonl`;
+		for (const dir of readdirSync(projectsRoot)) {
+			const candidate = join(projectsRoot, dir, suffix);
+			if (existsSync(candidate)) return candidate;
+		}
+	} catch {
+		// ignore lookup failures
+	}
+	return undefined;
 }
 
 function getExistingToolResultIds(sessionId: string, cwd: string): Set<string> {
 	const ids = new Set<string>();
 	try {
 		const sessionFilePath = getSdkSessionFilePath(sessionId, cwd);
-		if (!existsSync(sessionFilePath)) return ids;
+		if (!sessionFilePath || !existsSync(sessionFilePath)) return ids;
 		const lines = readFileSync(sessionFilePath, "utf-8").split("\n");
 		for (const line of lines) {
 			if (!line.trim()) continue;
@@ -954,6 +983,60 @@ function getExistingToolResultIds(sessionId: string, cwd: string): Set<string> {
 		// ignore parse/read failures
 	}
 	return ids;
+}
+
+function getToolUseIdsForAssistantUuid(sessionId: string, cwd: string, assistantUuid: string | undefined): Set<string> {
+	const ids = new Set<string>();
+	if (!assistantUuid) return ids;
+	try {
+		const sessionFilePath = getSdkSessionFilePath(sessionId, cwd);
+		if (!sessionFilePath || !existsSync(sessionFilePath)) return ids;
+		const lines = readFileSync(sessionFilePath, "utf-8").split("\n");
+		for (const line of lines) {
+			if (!line.trim()) continue;
+			let parsed: any;
+			try {
+				parsed = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			if (parsed?.type !== "assistant") continue;
+			if (parsed?.uuid !== assistantUuid) continue;
+			const content = parsed?.message?.content;
+			if (!Array.isArray(content)) continue;
+			for (const block of content) {
+				if (
+					block?.type === "tool_use" &&
+					typeof block?.id === "string" &&
+					block.id.trim().length > 0
+				) {
+					ids.add(block.id);
+				}
+			}
+		}
+	} catch {
+		// ignore parse/read failures
+	}
+	return ids;
+}
+
+function filterReplayToolUseIdsForResumeAnchor(
+	candidateToolUseIds: Set<string> | undefined,
+	sessionId: string | undefined,
+	cwd: string,
+	resumeSessionAt: string | undefined,
+): Set<string> {
+	if (!candidateToolUseIds || candidateToolUseIds.size === 0) {
+		return new Set<string>();
+	}
+	if (!sessionId || !resumeSessionAt) {
+		return new Set<string>();
+	}
+	const anchorToolUseIds = getToolUseIdsForAssistantUuid(sessionId, cwd, resumeSessionAt);
+	if (anchorToolUseIds.size === 0) {
+		return new Set<string>();
+	}
+	return new Set([...candidateToolUseIds].filter((id) => anchorToolUseIds.has(id)));
 }
 
 function getPiSessionFilePath(sessionId: string, cwd: string): string | undefined {
@@ -1504,7 +1587,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 						forkSession = forkPlan.forkSession;
 					}
 					if (branchState.pendingToolUseTimestamp != null) {
-						const pendingUuid = branchState.uuidByAssistantTimestamp.get(branchState.pendingToolUseTimestamp);
+						const pendingUuid = getLatestAssistantUuidAtTimestamp(
+							branchState,
+							branchState.pendingToolUseTimestamp,
+						);
 						const pendingToolUseIdSet = new Set(branchState.pendingToolUseIds ?? []);
 						const canReplayStructuredToolResults =
 							Boolean(pendingUuid) &&
@@ -1516,6 +1602,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 							} else {
 								tailAllowedToolUseIds = new Set(
 									[...tailAllowedToolUseIds].filter((id) => pendingToolUseIdSet.has(id)),
+								);
+							}
+							if (tailAllowedToolUseIds.size > 0) {
+								tailAllowedToolUseIds = filterReplayToolUseIdsForResumeAnchor(
+									tailAllowedToolUseIds,
+									resumeSessionId,
+									cwd,
+									resumeSessionAt,
 								);
 							}
 						} else {
@@ -1967,4 +2061,6 @@ export const __test = {
 	isErroredAssistantMessage,
 	sanitizeAssistantContentForEmit,
 	isIgnorableTransportWriteAfterCloseError,
+	filterReplayToolUseIdsForResumeAnchor,
+	getToolUseIdsForAssistantUuid,
 };
