@@ -222,6 +222,129 @@ test("pending replay anchor filtering keeps only tool_result ids present in resu
 	}
 });
 
+test("anchor filtering coalesces parallel tool_uses split across UUIDs via message.id", async () => {
+	const unique = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+	const fakeCwd = join(tmpdir(), `casdk-coalesce-${unique}`);
+	const projectDir = `-${fakeCwd.replace(/[^a-zA-Z0-9]/g, "-")}`;
+	const projectPath = join(homedir(), ".claude", "projects", projectDir);
+	const sessionId = `sdk-coalesce-${unique}`;
+	const sessionFile = join(projectPath, `${sessionId}.jsonl`);
+	mkdirSync(projectPath, { recursive: true });
+
+	// Simulate SDK splitting one API response into 4 entries with the same message.id:
+	// thinking, text, tool_use #1, tool_use #2 — each in a separate UUID
+	const sharedMessageId = "msg_test_coalesce_123";
+	writeFileSync(
+		sessionFile,
+		[
+			JSON.stringify({
+				type: "assistant",
+				uuid: "uuid-thinking",
+				message: {
+					id: sharedMessageId,
+					content: [{ type: "thinking", thinking: "Let me run both commands." }],
+				},
+			}),
+			JSON.stringify({
+				type: "assistant",
+				uuid: "uuid-text",
+				message: {
+					id: sharedMessageId,
+					content: [{ type: "text", text: "I'll run two commands." }],
+				},
+			}),
+			JSON.stringify({
+				type: "assistant",
+				uuid: "uuid-tool1",
+				message: {
+					id: sharedMessageId,
+					content: [
+						{ type: "tool_use", id: "toolu_bash1", name: "Bash", input: { command: "ls" } },
+					],
+				},
+			}),
+			JSON.stringify({
+				type: "assistant",
+				uuid: "uuid-tool2",
+				message: {
+					id: sharedMessageId,
+					content: [
+						{ type: "tool_use", id: "toolu_bash2", name: "Bash", input: { command: "pwd" } },
+					],
+				},
+			}),
+		].join("\n") + "\n",
+		"utf-8",
+	);
+
+	try {
+		// Anchor at the LAST UUID (as the adapter does) — should find BOTH tool_uses
+		const anchorIds = __test.getToolUseIdsForAssistantUuid(sessionId, fakeCwd, "uuid-tool2");
+		assert.equal(anchorIds.size, 2, "should find both tool_use IDs via message.id coalescing");
+		assert.equal(anchorIds.has("toolu_bash1"), true, "should include tool_use from uuid-tool1");
+		assert.equal(anchorIds.has("toolu_bash2"), true, "should include tool_use from uuid-tool2");
+
+		// filterReplayToolUseIdsForResumeAnchor should now keep both
+		const filtered = __test.filterReplayToolUseIdsForResumeAnchor(
+			new Set(["toolu_bash1", "toolu_bash2"]),
+			sessionId,
+			fakeCwd,
+			"uuid-tool2",
+		);
+		assert.equal(filtered.size, 2, "filter should keep both tool IDs");
+		assert.equal(filtered.has("toolu_bash1"), true);
+		assert.equal(filtered.has("toolu_bash2"), true);
+	} finally {
+		rmSync(projectPath, { recursive: true, force: true });
+	}
+});
+
+test("anchor filtering falls back to single UUID when message.id is absent", async () => {
+	const unique = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+	const fakeCwd = join(tmpdir(), `casdk-fallback-${unique}`);
+	const projectDir = `-${fakeCwd.replace(/[^a-zA-Z0-9]/g, "-")}`;
+	const projectPath = join(homedir(), ".claude", "projects", projectDir);
+	const sessionId = `sdk-fallback-${unique}`;
+	const sessionFile = join(projectPath, `${sessionId}.jsonl`);
+	mkdirSync(projectPath, { recursive: true });
+
+	// Entries WITHOUT message.id — should fall back to exact UUID match
+	writeFileSync(
+		sessionFile,
+		[
+			JSON.stringify({
+				type: "assistant",
+				uuid: "uuid-a",
+				message: {
+					content: [
+						{ type: "tool_use", id: "toolu_a", name: "Read", input: {} },
+					],
+				},
+			}),
+			JSON.stringify({
+				type: "assistant",
+				uuid: "uuid-b",
+				message: {
+					content: [
+						{ type: "tool_use", id: "toolu_b", name: "Bash", input: {} },
+					],
+				},
+			}),
+		].join("\n") + "\n",
+		"utf-8",
+	);
+
+	try {
+		// Without message.id, only the exact anchor UUID's tool_use should be returned
+		const anchorIds = __test.getToolUseIdsForAssistantUuid(sessionId, fakeCwd, "uuid-b");
+		assert.equal(anchorIds.size, 1, "fallback should only find anchor UUID's tool_use");
+		assert.equal(anchorIds.has("toolu_b"), true);
+		assert.equal(anchorIds.has("toolu_a"), false, "should NOT include other UUID's tool_use");
+	} finally {
+		rmSync(projectPath, { recursive: true, force: true });
+	}
+});
+
 test("pending tool-use continuation -> replay tool results, do not summarize", () => {
 	const tail: Context["messages"] = [toolResult("toolu_123", "ok"), user("continue")];
 	const plan = __test.analyzeResumeTailMessages(tail, 123456);
@@ -261,7 +384,7 @@ test("tree/fork-style divergence (branch behind all) triggers Claude fork anchor
 	assert.equal(plan.forkSession, true);
 });
 
-test("pending tool-use timestamp forces fork from pending assistant uuid", () => {
+test("pending tool-use timestamp resumes in-place (no fork) from pending assistant uuid", () => {
 	const branch = {
 		sdkSessionId: "sdk-1",
 		uuidByAssistantTimestamp: new Map<number, string[]>([
@@ -282,7 +405,11 @@ test("pending tool-use timestamp forces fork from pending assistant uuid", () =>
 
 	const plan = __test.computeResumeForkPlan(branch, all);
 	assert.equal(plan.resumeSessionAt, "uuid-200");
-	assert.equal(plan.forkSession, true);
+	// Must NOT fork: the SDK processes parallel tool_uses sequentially with
+	// interleaved tool_results. Forking creates a new session that doesn't
+	// include parent message history in the API call, causing tool_result
+	// blocks to appear as messages[0] without matching tool_use → API 400.
+	assert.equal(plan.forkSession, false);
 });
 
 test("pending tool-use timestamp picks latest uuid when multiple assistants share timestamp", () => {
@@ -300,7 +427,7 @@ test("pending tool-use timestamp picks latest uuid when multiple assistants shar
 
 	const plan = __test.computeResumeForkPlan(branch, all);
 	assert.equal(plan.resumeSessionAt, "uuid-latest");
-	assert.equal(plan.forkSession, true);
+	assert.equal(plan.forkSession, false);
 });
 
 test("buildSdkStateFromEntries ignores non-provider entries and tracks latest sdk state", () => {

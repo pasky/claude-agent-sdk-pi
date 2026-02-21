@@ -533,7 +533,16 @@ function computeResumeForkPlan(
 		const pendingUuid = getLatestAssistantUuidAtTimestamp(branchState, branchState.pendingToolUseTimestamp);
 		if (pendingUuid) {
 			resumeSessionAt = pendingUuid;
-			forkSession = true;
+			// Resume in-place instead of forking. The SDK processes parallel tool_uses
+			// sequentially, interleaving tool_results between them:
+			//   assistant(tool_use₁) → user(tool_result₁) → assistant(tool_use₂)
+			// When forking (--fork-session), the new session does NOT include parent
+			// message history in the API call. This means our tool_result becomes
+			// messages[0] with no preceding tool_use → API 400 error.
+			// Resuming in-place (--resume + --resume-session-at without --fork-session)
+			// properly includes the full parent conversation chain, ensuring tool_results
+			// match their corresponding tool_uses in the API messages array.
+			forkSession = false;
 		}
 	}
 
@@ -992,6 +1001,19 @@ function getToolUseIdsForAssistantUuid(sessionId: string, cwd: string, assistant
 		const sessionFilePath = getSdkSessionFilePath(sessionId, cwd);
 		if (!sessionFilePath || !existsSync(sessionFilePath)) return ids;
 		const lines = readFileSync(sessionFilePath, "utf-8").split("\n");
+
+		// The SDK splits a single API response into multiple session entries, each with
+		// a unique UUID but sharing the same message.id (API message ID). The fork anchor
+		// is the last UUID of the response, but tool_use blocks may be spread across
+		// multiple entries. We need to collect tool_use IDs from ALL entries in the same
+		// response, not just the anchor entry.
+		//
+		// Strategy: single pass to find the anchor's message.id, then collect all
+		// tool_use IDs from entries sharing that message.id.
+
+		let anchorMessageId: string | undefined;
+		const entriesByMessageId = new Map<string, any[]>();
+
 		for (const line of lines) {
 			if (!line.trim()) continue;
 			let parsed: any;
@@ -1001,16 +1023,66 @@ function getToolUseIdsForAssistantUuid(sessionId: string, cwd: string, assistant
 				continue;
 			}
 			if (parsed?.type !== "assistant") continue;
-			if (parsed?.uuid !== assistantUuid) continue;
-			const content = parsed?.message?.content;
-			if (!Array.isArray(content)) continue;
-			for (const block of content) {
-				if (
-					block?.type === "tool_use" &&
-					typeof block?.id === "string" &&
-					block.id.trim().length > 0
-				) {
-					ids.add(block.id);
+
+			const messageId = parsed?.message?.id;
+			if (parsed?.uuid === assistantUuid && typeof messageId === "string") {
+				anchorMessageId = messageId;
+			}
+
+			if (typeof messageId === "string" && messageId.length > 0) {
+				let group = entriesByMessageId.get(messageId);
+				if (!group) {
+					group = [];
+					entriesByMessageId.set(messageId, group);
+				}
+				group.push(parsed);
+			}
+		}
+
+		// Collect tool_use IDs from all entries in the anchor's response
+		const targetEntries = anchorMessageId
+			? entriesByMessageId.get(anchorMessageId)
+			: undefined;
+
+		if (targetEntries) {
+			for (const entry of targetEntries) {
+				const content = entry?.message?.content;
+				if (!Array.isArray(content)) continue;
+				for (const block of content) {
+					if (
+						block?.type === "tool_use" &&
+						typeof block?.id === "string" &&
+						block.id.trim().length > 0
+					) {
+						ids.add(block.id);
+					}
+				}
+			}
+		}
+
+		// Fallback: if we couldn't resolve via message.id (e.g. missing field),
+		// fall back to exact UUID match only.
+		if (ids.size === 0) {
+			for (const line of lines) {
+				if (!line.trim()) continue;
+				let parsed: any;
+				try {
+					parsed = JSON.parse(line);
+				} catch {
+					continue;
+				}
+				if (parsed?.type !== "assistant") continue;
+				if (parsed?.uuid !== assistantUuid) continue;
+				const content = parsed?.message?.content;
+				if (!Array.isArray(content)) continue;
+				for (const block of content) {
+					if (
+						block?.type === "tool_use" &&
+						typeof block?.id === "string" &&
+						block.id.trim().length > 0
+					) {
+						ids.add(block.id);
+					}
 				}
 			}
 		}
@@ -1611,6 +1683,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 									cwd,
 									resumeSessionAt,
 								);
+							}
+							// With getToolUseIdsForAssistantUuid now coalescing all tool_use IDs
+							// from the same API response (grouped by message.id), the anchor
+							// intersection should cover all parallel tool_uses. If the intersection
+							// is empty (no matching tool_uses found at anchor), fall back to text
+							// summaries for safety.
+							if (tailAllowedToolUseIds.size === 0) {
+								tailAllowedToolUseIds = new Set<string>();
 							}
 						} else {
 							// Avoid emitting raw tool_result blocks without guaranteed matching tool_use context.
