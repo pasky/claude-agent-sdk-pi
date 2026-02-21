@@ -702,6 +702,15 @@ type ProviderSettings = {
 	appendSystemPrompt?: boolean;
 
 	/**
+	 * When true, completely overrides Claude Code's system prompt with pi's system prompt.
+	 * This takes precedence over appendSystemPrompt.
+	 *
+	 * - true  => Use pi's context.systemPrompt as a complete replacement
+	 * - false => Use Claude Code's preset system prompt (default)
+	 */
+	overrideSystemPrompt?: boolean;
+
+	/**
 	 * Controls which filesystem-based configuration sources the SDK loads settings from
 	 * (maps to Claude Code CLI --setting-sources)
 	 *
@@ -752,6 +761,11 @@ function readSettingsFile(filePath: string): ProviderSettings {
 				? settingsBlock["appendSystemPrompt"]
 				: undefined;
 
+		const overrideSystemPrompt =
+			typeof settingsBlock["overrideSystemPrompt"] === "boolean"
+				? settingsBlock["overrideSystemPrompt"]
+				: undefined;
+
 		const settingSourcesRaw = settingsBlock["settingSources"];
 		const settingSources =
 			Array.isArray(settingSourcesRaw) &&
@@ -768,6 +782,7 @@ function readSettingsFile(filePath: string): ProviderSettings {
 		const legacyDisable = false;
 		return {
 			appendSystemPrompt: appendSystemPrompt ?? (legacyDisable ? false : undefined),
+			overrideSystemPrompt,
 			settingSources,
 			strictMcpConfig,
 		};
@@ -1838,6 +1853,35 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					}
 					if (forkPlan.forkSession !== undefined) {
 						forkSession = forkPlan.forkSession;
+					}
+					if (branchState.pendingToolUseTimestamp != null && resumeSessionId && resumeSessionAt) {
+						// Check if ALL pending tool_uses have already been completed
+						// by the SDK internally (e.g., Read auto-approved via built-in
+						// PreToolUse hooks). The SDK runs these tools and writes their
+						// results to the session before exiting, but the adapter records
+						// them as "pending" because it breaks from the event loop on
+						// message_stop before the SDK finishes executing them.
+						const pendingIds = new Set(branchState.pendingToolUseIds ?? []);
+						if (pendingIds.size > 0) {
+							const completedIds = getExistingToolResultIds(resumeSessionId, cwd);
+							for (const id of completedIds) {
+								pendingIds.delete(id);
+							}
+						}
+						if (pendingIds.size === 0) {
+							// All pending tools were already completed by the SDK.
+							// The SDK continued past our last known assistant UUID,
+							// so resumeSessionAt would truncate the chain too early.
+							// Clear pending state AND resumeSessionAt to let the
+							// SDK load the full chain on resume.
+							persistSdkEntry(sessionKey, {
+								providerId: PROVIDER_ID,
+								pendingToolUseTimestamp: null,
+								pendingToolUseIds: null,
+							});
+							resumeSessionAt = undefined;
+							// Fall through to normal resume handling below
+						}
 					}
 					if (branchState.pendingToolUseTimestamp != null && resumeSessionId && resumeSessionAt) {
 						// The SDK stores parallel tool_uses as separate assistant
