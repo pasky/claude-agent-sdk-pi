@@ -1664,39 +1664,17 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 							branchState.pendingToolUseTimestamp,
 						);
 						const pendingToolUseIdSet = new Set(branchState.pendingToolUseIds ?? []);
-						const canReplayStructuredToolResults =
-							Boolean(pendingUuid) &&
-							resumeSessionAt === pendingUuid &&
-							pendingToolUseIdSet.size > 0;
-						if (canReplayStructuredToolResults) {
-							if (!tailAllowedToolUseIds) {
-								tailAllowedToolUseIds = pendingToolUseIdSet;
-							} else {
-								tailAllowedToolUseIds = new Set(
-									[...tailAllowedToolUseIds].filter((id) => pendingToolUseIdSet.has(id)),
-								);
-							}
-							if (tailAllowedToolUseIds.size > 0) {
-								tailAllowedToolUseIds = filterReplayToolUseIdsForResumeAnchor(
-									tailAllowedToolUseIds,
-									resumeSessionId,
-									cwd,
-									resumeSessionAt,
-								);
-							}
-							// With getToolUseIdsForAssistantUuid now coalescing all tool_use IDs
-							// from the same API response (grouped by message.id), the anchor
-							// intersection should cover all parallel tool_uses. If the intersection
-							// is empty (no matching tool_uses found at anchor), fall back to text
-							// summaries for safety.
-							if (tailAllowedToolUseIds.size === 0) {
-								tailAllowedToolUseIds = new Set<string>();
-							}
-						} else {
-							// Avoid emitting raw tool_result blocks without guaranteed matching tool_use context.
-							// Fallback to textual replay summaries instead.
-							tailAllowedToolUseIds = new Set<string>();
-						}
+						// Always use text summaries for pending tool_use replays.
+						// Native tool_result blocks don't work with the SDK's resume mechanism:
+						// the SDK's --resume + --resume-session-at creates a new CLI session that
+						// includes the original conversation history in the API call. However, the
+						// SDK's deny+interrupt flow already records tool_result entries in the session
+						// for each denied tool_use. Sending additional native tool_result blocks on
+						// resume causes either:
+						// - "unexpected tool_use_id" errors (tool_result as messages[0] in forked sessions)
+						// - Duplicate/conflicting tool_results in the conversation
+						// Text summaries avoid both issues and work reliably with resume.
+						tailAllowedToolUseIds = new Set<string>();
 						if (!tailPlan.tailHasAssistant) {
 							prompt = buildResumePromptFromTail(resumeTailMessages, supportsImages, tailAllowedToolUseIds);
 						}
