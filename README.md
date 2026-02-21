@@ -8,7 +8,7 @@ This extension registers a custom provider that routes LLM calls through the **C
 - Tool execution is **blocked in Claude Code**; pi executes tools natively.
 - Built-in tool calls are mapped to Claude Code tool names.
 - Custom tools are exposed to Claude Code via in-process MCP.
-- Skills can be appended to Claude Code’s default system prompt (optional).
+- Skills can be appended to Claude Code's default system prompt (optional).
 
 ## Demo
 
@@ -89,10 +89,10 @@ The provider automatically maps these back to the pi tool name (e.g. `subagent`)
 ## Context loading
 
 1) **Append to system prompt (Default)**
-   - Uses **AGENTS.md + skills** from pi and appends to Claude Code’s preset prompt.
+   - Uses **AGENTS.md + skills** from pi and appends to Claude Code's preset prompt.
    - No extra config needed.
 
-2) **Use Claude Code’s dir (Recommended)**
+2) **Use Claude Code's dir (Recommended)**
    - Set `appendSystemPrompt: false` so Claude Code loads its own resources from `.claude/`.
    - By default it loads both user + project settings (`["user","project"]`).
    - If you want to **ignore project-level `.claude/` folders**, set `settingSources: ["user"]`.
@@ -115,3 +115,28 @@ The provider automatically maps these back to the pi tool name (e.g. `subagent`)
    ln -s ~/.pi/agent/AGENTS.md ~/.claude/CLAUDE.md
    ln -s ~/.pi/agent/skills ~/.claude/skills
    ```
+
+3) **Full system prompt override (Pi-native mode)**
+   - Set `overrideSystemPrompt: true` to **completely replace** Claude Code's system prompt with pi's prompt.
+   - This uses pi's `context.systemPrompt` directly, giving you full control over the assistant behavior.
+   - When enabled, `appendSystemPrompt` and `settingSources` are ignored.
+
+   **Config:**
+   ```json
+   {
+     "claudeAgentSdkProvider": {
+       "overrideSystemPrompt": true
+     }
+   }
+   ```
+
+## Configuration Reference
+
+All settings go in `~/.pi/agent/settings.json` or `.pi/settings.json` under the `claudeAgentSdkProvider` key:
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `appendSystemPrompt` | `boolean` | `true` | Append AGENTS.md + skills to Claude Code's preset prompt |
+| `overrideSystemPrompt` | `boolean` | `false` | **Completely replace** Claude Code's prompt with pi's prompt (takes precedence) |
+| `settingSources` | `string[]` | `["user","project"]` | Which `.claude/` directories to load (used when `appendSystemPrompt: false`) |
+| `strictMcpConfig` | `boolean` | `true` | Ignore MCP servers from `~/.claude.json` (reduces token overhead) |

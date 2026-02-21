@@ -1968,7 +1968,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 			const mcpServers = buildCustomToolServers(customTools);
 			const providerSettings = loadProviderSettings();
-			const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
+			const useSystemPromptOverride = providerSettings.overrideSystemPrompt === true;
+			const appendSystemPrompt = !useSystemPromptOverride && providerSettings.appendSystemPrompt !== false;
 			const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
 			const skillsAppend = appendSystemPrompt ? extractSkillsAppend(context.systemPrompt) : undefined;
 			const appendParts = [agentsAppend, skillsAppend].filter((part): part is string => Boolean(part));
@@ -2003,11 +2004,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 						toolUseID: permissionOptions.toolUseID,
 					};
 				},
-				systemPrompt: {
-					type: "preset",
-					preset: "claude_code",
-					append: systemPromptAppend ? systemPromptAppend : undefined,
-				},
+				systemPrompt: useSystemPromptOverride
+					? (context.systemPrompt ?? "You are a helpful AI assistant.")
+					: {
+						type: "preset",
+						preset: "claude_code",
+						append: systemPromptAppend ? systemPromptAppend : undefined,
+					},
 				...(settingSources ? { settingSources } : {}),
 				...(extraArgs ? { extraArgs } : {}),
 				...(mcpServers ? { mcpServers } : {}),
