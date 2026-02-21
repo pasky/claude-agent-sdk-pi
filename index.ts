@@ -995,36 +995,45 @@ function getExistingToolResultIds(sessionId: string, cwd: string): Set<string> {
 }
 
 /**
- * Write tool_result entries to the SDK session file for orphaned tool_uses
- * (tool_uses that have no matching tool_result in the session).
+ * Ensure all tool_uses in the resume chain have matching tool_results.
  *
- * This is needed because the SDK processes parallel tool_uses sequentially and
- * when one is denied with interrupt, subsequent tool_uses become orphaned (no
- * tool_result recorded). The SDK's message loading (NW6/Tg1) filters out
- * assistant messages containing only orphaned tool_uses, which breaks
- * --resume-session-at UUID lookup.
+ * The SDK stores parallel tool_uses as separate assistant messages in a
+ * BRANCHING tree. When resumed, getLastLog + bp1 follow only ONE branch
+ * via parentUuid links. Tool_results on sibling branches are invisible
+ * to the loaded chain, causing NW6 to filter assistant messages with
+ * "orphaned" tool_uses (tool_uses whose results are on other branches).
  *
- * By writing the real tool_results to the session file, we:
- * 1. Prevent NW6 from filtering out the assistant messages
- * 2. Ensure the resume UUID is findable in the processed messages
- * 3. Provide real tool results that the API will see on resume
+ * This function:
+ * 1. Builds the chain from resumeSessionAt UUID via parentUuid links
+ * 2. Finds all tool_use IDs from assistant messages in that chain
+ * 3. Checks which tool_results are missing from the chain (may exist
+ *    on sibling branches or only in resumeTailMessages)
+ * 4. Writes a SINGLE combined user message with ALL missing tool_results
+ *    as a child of resumeSessionAt, so the chain becomes complete
+ *
+ * After this, the caller should NOT pass resumeSessionAt to the SDK,
+ * letting it load the full chain (which now ends with our combined
+ * tool_result message). This avoids truncation issues where the last
+ * message would be an assistant/tool_use without a tool_result.
+ *
+ * Returns true if a combined tool_result was written (caller should
+ * clear resumeSessionAt).
  */
-function writeOrphanedToolResults(
+function ensureCompleteToolResults(
 	sessionId: string,
 	cwd: string,
-	toolResultsByToolUseId: Map<string, { content: string | object[]; isError: boolean }>,
-): void {
+	resumeSessionAtUuid: string,
+	extraToolResults: Map<string, { content: string | object[]; isError: boolean }>,
+): boolean {
 	try {
 		const sessionFilePath = getSdkSessionFilePath(sessionId, cwd);
-		if (!sessionFilePath || !existsSync(sessionFilePath)) return;
-		const existingIds = getExistingToolResultIds(sessionId, cwd);
+		if (!sessionFilePath || !existsSync(sessionFilePath)) return false;
 
-		// Read session to find orphaned tool_uses and their parent info
 		const lines = readFileSync(sessionFilePath, "utf-8").split("\n");
 
-		// Collect all tool_use IDs and their parent assistant UUIDs
-		const toolUseParents = new Map<string, { assistantUuid: string; slug?: string }>();
-		let lastSessionMeta: { sessionId: string; version: string; gitBranch: string; cwd: string; userType: string } | undefined;
+		// Parse all messages, indexed by UUID
+		const messagesByUuid = new Map<string, any>();
+		let lastSessionMeta: { sessionId: string; version: string; gitBranch: string; cwd: string; userType: string; slug?: string } | undefined;
 
 		for (const line of lines) {
 			if (!line.trim()) continue;
@@ -1034,7 +1043,6 @@ function writeOrphanedToolResults(
 			} catch {
 				continue;
 			}
-			// Capture session metadata from any entry
 			if (parsed?.sessionId && parsed?.version) {
 				lastSessionMeta = {
 					sessionId: parsed.sessionId,
@@ -1042,60 +1050,128 @@ function writeOrphanedToolResults(
 					gitBranch: parsed.gitBranch ?? "HEAD",
 					cwd: parsed.cwd ?? cwd,
 					userType: parsed.userType ?? "external",
+					...(parsed.slug ? { slug: parsed.slug } : {}),
 				};
 			}
-			if (parsed?.type !== "assistant") continue;
-			const content = parsed?.message?.content;
+			if (parsed?.uuid && (parsed?.type === "user" || parsed?.type === "assistant")) {
+				messagesByUuid.set(parsed.uuid, parsed);
+			}
+		}
+
+		if (!lastSessionMeta) return false;
+
+		// Build the chain from resumeSessionAtUuid by following parentUuid links
+		const chainUuids = new Set<string>();
+		let current = messagesByUuid.get(resumeSessionAtUuid);
+		while (current) {
+			if (chainUuids.has(current.uuid)) break; // cycle guard
+			chainUuids.add(current.uuid);
+			current = current.parentUuid ? messagesByUuid.get(current.parentUuid) : undefined;
+		}
+
+		// Collect all tool_use IDs from assistant messages in the chain
+		const chainToolUseIds = new Set<string>();
+		for (const uuid of chainUuids) {
+			const msg = messagesByUuid.get(uuid);
+			if (msg?.type !== "assistant") continue;
+			const content = msg?.message?.content;
 			if (!Array.isArray(content)) continue;
-			const uuid = parsed?.uuid;
-			const slug = parsed?.slug;
 			for (const block of content) {
 				if (block?.type === "tool_use" && typeof block?.id === "string") {
-					toolUseParents.set(block.id, { assistantUuid: uuid, slug });
+					chainToolUseIds.add(block.id);
 				}
 			}
 		}
 
-		if (!lastSessionMeta) return;
+		if (chainToolUseIds.size === 0) return false;
 
-		// Write tool_results for orphaned tool_uses that we have results for
-		const entries: string[] = [];
-		for (const [toolUseId, result] of toolResultsByToolUseId) {
-			if (existingIds.has(toolUseId)) continue; // Already has a result
-			const parent = toolUseParents.get(toolUseId);
-			if (!parent) continue; // Tool_use not in session
-
-			const uuid = crypto.randomUUID();
-			const entry = {
-				parentUuid: parent.assistantUuid,
-				isSidechain: false,
-				userType: lastSessionMeta.userType,
-				cwd: lastSessionMeta.cwd,
-				sessionId: lastSessionMeta.sessionId,
-				version: lastSessionMeta.version,
-				gitBranch: lastSessionMeta.gitBranch,
-				...(parent.slug ? { slug: parent.slug } : {}),
-				type: "user",
-				uuid,
-				timestamp: new Date().toISOString(),
-				message: {
-					role: "user",
-					content: [{
-						type: "tool_result",
-						tool_use_id: toolUseId,
-						content: typeof result.content === "string" ? result.content : result.content,
-						...(result.isError ? { is_error: true } : {}),
-					}],
-				},
-			};
-			entries.push(JSON.stringify(entry));
+		// Collect tool_result IDs already in the chain
+		const chainToolResultIds = new Set<string>();
+		for (const uuid of chainUuids) {
+			const msg = messagesByUuid.get(uuid);
+			if (msg?.type !== "user") continue;
+			const content = msg?.message?.content;
+			if (!Array.isArray(content)) continue;
+			for (const block of content) {
+				if (block?.type === "tool_result" && typeof block?.tool_use_id === "string") {
+					chainToolResultIds.add(block.tool_use_id);
+				}
+			}
 		}
 
-		if (entries.length > 0) {
-			appendFileSync(sessionFilePath, entries.join("\n") + "\n");
+		// Find missing tool_results: tool_uses in chain without results in chain
+		const missingToolUseIds = new Set([...chainToolUseIds].filter(id => !chainToolResultIds.has(id)));
+		if (missingToolUseIds.size === 0) return false;
+
+		// Gather results from sibling branches in the session
+		const siblingResults = new Map<string, any>(); // tool_use_id -> tool_result block
+		for (const [, msg] of messagesByUuid) {
+			if (msg.type !== "user") continue;
+			if (chainUuids.has(msg.uuid)) continue; // Already in chain
+			const content = msg?.message?.content;
+			if (!Array.isArray(content)) continue;
+			for (const block of content) {
+				if (block?.type === "tool_result" && missingToolUseIds.has(block.tool_use_id)) {
+					siblingResults.set(block.tool_use_id, block);
+				}
+			}
 		}
+
+		// Build the combined tool_result content blocks
+		const combinedContent: any[] = [];
+		for (const toolUseId of missingToolUseIds) {
+			// Try sibling branch result first
+			const siblingResult = siblingResults.get(toolUseId);
+			if (siblingResult) {
+				combinedContent.push(siblingResult);
+				continue;
+			}
+			// Try extraToolResults (from resumeTailMessages)
+			const extra = extraToolResults.get(toolUseId);
+			if (extra) {
+				combinedContent.push({
+					type: "tool_result",
+					tool_use_id: toolUseId,
+					content: typeof extra.content === "string" ? extra.content : extra.content,
+					...(extra.isError ? { is_error: true } : {}),
+				});
+				continue;
+			}
+			// Last resort: error result so the chain is complete
+			combinedContent.push({
+				type: "tool_result",
+				tool_use_id: toolUseId,
+				content: "Tool execution was interrupted.",
+				is_error: true,
+			});
+		}
+
+		if (combinedContent.length === 0) return false;
+
+		// Write the combined tool_result as child of resumeSessionAtUuid
+		const uuid = crypto.randomUUID();
+		const entry = {
+			parentUuid: resumeSessionAtUuid,
+			isSidechain: false,
+			userType: lastSessionMeta.userType,
+			cwd: lastSessionMeta.cwd,
+			sessionId: lastSessionMeta.sessionId,
+			version: lastSessionMeta.version,
+			gitBranch: lastSessionMeta.gitBranch,
+			...(lastSessionMeta.slug ? { slug: lastSessionMeta.slug } : {}),
+			type: "user",
+			uuid,
+			timestamp: new Date().toISOString(),
+			message: {
+				role: "user",
+				content: combinedContent,
+			},
+		};
+
+		appendFileSync(sessionFilePath, JSON.stringify(entry) + "\n");
+		return true;
 	} catch {
-		// ignore write failures
+		return false;
 	}
 }
 
@@ -1763,21 +1839,23 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					if (forkPlan.forkSession !== undefined) {
 						forkSession = forkPlan.forkSession;
 					}
-					if (branchState.pendingToolUseTimestamp != null && resumeSessionId) {
-						// Write any missing tool_results directly to the SDK session file.
-						// The SDK processes parallel tool_uses sequentially; when the first
-						// is denied with interrupt, subsequent tool_uses become orphaned (no
-						// tool_result). The SDK's message loading filters out assistant messages
-						// with only orphaned tool_uses, breaking --resume-session-at.
-						// By writing the real results to the session, all tool_uses are paired
-						// and the resume UUID lookup succeeds.
-						const toolResultMap = new Map<string, { content: string | object[]; isError: boolean }>();
+					if (branchState.pendingToolUseTimestamp != null && resumeSessionId && resumeSessionAt) {
+						// The SDK stores parallel tool_uses as separate assistant
+						// messages in a BRANCHING tree. On resume, only one branch
+						// is followed (via parentUuid), so tool_results on sibling
+						// branches are invisible. This causes NW6 to filter assistant
+						// messages with "orphaned" tool_uses and breaks resume.
+						//
+						// Fix: write a combined tool_result containing ALL missing
+						// results (from sibling branches + resumeTailMessages) as a
+						// child of the last assistant, then DON'T pass resumeSessionAt
+						// so the SDK loads the full chain naturally.
+						const extraToolResults = new Map<string, { content: string | object[]; isError: boolean }>();
 						if (resumeTailMessages) {
 							for (const msg of resumeTailMessages) {
 								if (msg.role !== "toolResult") continue;
 								const toolUseId = (msg as any).toolCallId as string | undefined;
 								if (!toolUseId) continue;
-								// Collect tool result content
 								const textParts: string[] = [];
 								if (Array.isArray(msg.content)) {
 									for (const block of msg.content) {
@@ -1797,18 +1875,25 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 									textParts.push(msg.content);
 								}
 								const isError = (msg as any).isError === true;
-								toolResultMap.set(toolUseId, {
+								extraToolResults.set(toolUseId, {
 									content: textParts.join("\n"),
 									isError,
 								});
 							}
 						}
-						if (toolResultMap.size > 0) {
-							writeOrphanedToolResults(resumeSessionId, cwd, toolResultMap);
+						const wroteResults = ensureCompleteToolResults(
+							resumeSessionId, cwd, resumeSessionAt, extraToolResults,
+						);
+						if (wroteResults) {
+							// Clear resumeSessionAt so the SDK loads the full chain
+							// (which now ends with our combined tool_result message).
+							// If we kept resumeSessionAt, the SDK would truncate AT
+							// the assistant/tool_use message, leaving it as the last
+							// message — but the API expects tool_result after tool_use.
+							resumeSessionAt = undefined;
 						}
-						// Don't send tool_results as prompt — they're now in the session.
-						// The SDK will load the full conversation on resume.
-						// Use "Continue." to prompt the model to continue.
+						// Use "Continue." to prompt the model to continue from the
+						// tool results. The SDK loads the full conversation on resume.
 						prompt = "Continue.";
 						persistSdkEntry(sessionKey, {
 							providerId: PROVIDER_ID,
