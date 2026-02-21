@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { createSdkMcpServer, query, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam, ImageBlockParam, MessageParam, TextBlockParam } from "@anthropic-ai/sdk/resources";
 import { pascalCase } from "change-case";
-import { existsSync, readFileSync, readdirSync, statSync } from "fs";
+import { appendFileSync, existsSync, readFileSync, readdirSync, statSync } from "fs";
 import { homedir } from "os";
 import { dirname, join, relative, resolve } from "path";
 
@@ -994,6 +994,111 @@ function getExistingToolResultIds(sessionId: string, cwd: string): Set<string> {
 	return ids;
 }
 
+/**
+ * Write tool_result entries to the SDK session file for orphaned tool_uses
+ * (tool_uses that have no matching tool_result in the session).
+ *
+ * This is needed because the SDK processes parallel tool_uses sequentially and
+ * when one is denied with interrupt, subsequent tool_uses become orphaned (no
+ * tool_result recorded). The SDK's message loading (NW6/Tg1) filters out
+ * assistant messages containing only orphaned tool_uses, which breaks
+ * --resume-session-at UUID lookup.
+ *
+ * By writing the real tool_results to the session file, we:
+ * 1. Prevent NW6 from filtering out the assistant messages
+ * 2. Ensure the resume UUID is findable in the processed messages
+ * 3. Provide real tool results that the API will see on resume
+ */
+function writeOrphanedToolResults(
+	sessionId: string,
+	cwd: string,
+	toolResultsByToolUseId: Map<string, { content: string | object[]; isError: boolean }>,
+): void {
+	try {
+		const sessionFilePath = getSdkSessionFilePath(sessionId, cwd);
+		if (!sessionFilePath || !existsSync(sessionFilePath)) return;
+		const existingIds = getExistingToolResultIds(sessionId, cwd);
+
+		// Read session to find orphaned tool_uses and their parent info
+		const lines = readFileSync(sessionFilePath, "utf-8").split("\n");
+
+		// Collect all tool_use IDs and their parent assistant UUIDs
+		const toolUseParents = new Map<string, { assistantUuid: string; slug?: string }>();
+		let lastSessionMeta: { sessionId: string; version: string; gitBranch: string; cwd: string; userType: string } | undefined;
+
+		for (const line of lines) {
+			if (!line.trim()) continue;
+			let parsed: any;
+			try {
+				parsed = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			// Capture session metadata from any entry
+			if (parsed?.sessionId && parsed?.version) {
+				lastSessionMeta = {
+					sessionId: parsed.sessionId,
+					version: parsed.version,
+					gitBranch: parsed.gitBranch ?? "HEAD",
+					cwd: parsed.cwd ?? cwd,
+					userType: parsed.userType ?? "external",
+				};
+			}
+			if (parsed?.type !== "assistant") continue;
+			const content = parsed?.message?.content;
+			if (!Array.isArray(content)) continue;
+			const uuid = parsed?.uuid;
+			const slug = parsed?.slug;
+			for (const block of content) {
+				if (block?.type === "tool_use" && typeof block?.id === "string") {
+					toolUseParents.set(block.id, { assistantUuid: uuid, slug });
+				}
+			}
+		}
+
+		if (!lastSessionMeta) return;
+
+		// Write tool_results for orphaned tool_uses that we have results for
+		const entries: string[] = [];
+		for (const [toolUseId, result] of toolResultsByToolUseId) {
+			if (existingIds.has(toolUseId)) continue; // Already has a result
+			const parent = toolUseParents.get(toolUseId);
+			if (!parent) continue; // Tool_use not in session
+
+			const uuid = crypto.randomUUID();
+			const entry = {
+				parentUuid: parent.assistantUuid,
+				isSidechain: false,
+				userType: lastSessionMeta.userType,
+				cwd: lastSessionMeta.cwd,
+				sessionId: lastSessionMeta.sessionId,
+				version: lastSessionMeta.version,
+				gitBranch: lastSessionMeta.gitBranch,
+				...(parent.slug ? { slug: parent.slug } : {}),
+				type: "user",
+				uuid,
+				timestamp: new Date().toISOString(),
+				message: {
+					role: "user",
+					content: [{
+						type: "tool_result",
+						tool_use_id: toolUseId,
+						content: typeof result.content === "string" ? result.content : result.content,
+						...(result.isError ? { is_error: true } : {}),
+					}],
+				},
+			};
+			entries.push(JSON.stringify(entry));
+		}
+
+		if (entries.length > 0) {
+			appendFileSync(sessionFilePath, entries.join("\n") + "\n");
+		}
+	} catch {
+		// ignore write failures
+	}
+}
+
 function getToolUseIdsForAssistantUuid(sessionId: string, cwd: string, assistantUuid: string | undefined): Set<string> {
 	const ids = new Set<string>();
 	if (!assistantUuid) return ids;
@@ -1658,26 +1763,53 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					if (forkPlan.forkSession !== undefined) {
 						forkSession = forkPlan.forkSession;
 					}
-					if (branchState.pendingToolUseTimestamp != null) {
-						const pendingUuid = getLatestAssistantUuidAtTimestamp(
-							branchState,
-							branchState.pendingToolUseTimestamp,
-						);
-						const pendingToolUseIdSet = new Set(branchState.pendingToolUseIds ?? []);
-						// Always use text summaries for pending tool_use replays.
-						// Native tool_result blocks don't work with the SDK's resume mechanism:
-						// the SDK's --resume + --resume-session-at creates a new CLI session that
-						// includes the original conversation history in the API call. However, the
-						// SDK's deny+interrupt flow already records tool_result entries in the session
-						// for each denied tool_use. Sending additional native tool_result blocks on
-						// resume causes either:
-						// - "unexpected tool_use_id" errors (tool_result as messages[0] in forked sessions)
-						// - Duplicate/conflicting tool_results in the conversation
-						// Text summaries avoid both issues and work reliably with resume.
-						tailAllowedToolUseIds = new Set<string>();
-						if (!tailPlan.tailHasAssistant) {
-							prompt = buildResumePromptFromTail(resumeTailMessages, supportsImages, tailAllowedToolUseIds);
+					if (branchState.pendingToolUseTimestamp != null && resumeSessionId) {
+						// Write any missing tool_results directly to the SDK session file.
+						// The SDK processes parallel tool_uses sequentially; when the first
+						// is denied with interrupt, subsequent tool_uses become orphaned (no
+						// tool_result). The SDK's message loading filters out assistant messages
+						// with only orphaned tool_uses, breaking --resume-session-at.
+						// By writing the real results to the session, all tool_uses are paired
+						// and the resume UUID lookup succeeds.
+						const toolResultMap = new Map<string, { content: string | object[]; isError: boolean }>();
+						if (resumeTailMessages) {
+							for (const msg of resumeTailMessages) {
+								if (msg.role !== "toolResult") continue;
+								const toolUseId = (msg as any).toolCallId as string | undefined;
+								if (!toolUseId) continue;
+								// Collect tool result content
+								const textParts: string[] = [];
+								if (Array.isArray(msg.content)) {
+									for (const block of msg.content) {
+										if (typeof block === "string") {
+											textParts.push(block);
+										} else if (typeof block === "object" && block !== null) {
+											if ("text" in block && typeof block.text === "string") {
+												textParts.push(block.text);
+											} else if ("type" in block && block.type === "image") {
+												// Skip images for session file
+											} else {
+												textParts.push(JSON.stringify(block));
+											}
+										}
+									}
+								} else if (typeof msg.content === "string") {
+									textParts.push(msg.content);
+								}
+								const isError = (msg as any).isError === true;
+								toolResultMap.set(toolUseId, {
+									content: textParts.join("\n"),
+									isError,
+								});
+							}
 						}
+						if (toolResultMap.size > 0) {
+							writeOrphanedToolResults(resumeSessionId, cwd, toolResultMap);
+						}
+						// Don't send tool_results as prompt — they're now in the session.
+						// The SDK will load the full conversation on resume.
+						// Use "Continue." to prompt the model to continue.
+						prompt = "Continue.";
 						persistSdkEntry(sessionKey, {
 							providerId: PROVIDER_ID,
 							pendingToolUseTimestamp: null,
